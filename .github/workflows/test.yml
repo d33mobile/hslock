@@ -1,0 +1,25 @@
+name: test
+
+# Standalone host-test workflow. Independent of the format/lint tooling: it
+# drives the test Makefile directly (make -C test ...) rather than the format
+# PR's ci wrapper script, so this suite shares no files with the format PR.
+on:
+  push:
+    branches: [chore/tests, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules (qrcodegen/littlefs) are needed for the coverage build.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # gcc/make are preinstalled; valgrind + lcov are not.
+      - run: sudo apt-get update && sudo apt-get install -y valgrind lcov
+      # Hard gate: ASan+UBSan, then Valgrind. Coverage is report-only but must
+      # still build/run cleanly. Each step must exit 0 or the job fails.
+      - run: make -C test asan
+      - run: make -C test valgrind
+      - run: make -C test coverage

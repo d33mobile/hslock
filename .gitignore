@@ -3,3 +3,8 @@ build
 .vscode
 
 *.uf2
+
+# host test artifacts
+test/coverage/
+*.gcno
+*.gcda

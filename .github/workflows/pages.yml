@@ -1,0 +1,49 @@
+name: pages
+
+# Publishes the host-test coverage HTML report (test/coverage/html/) to GitHub
+# Pages. Kept separate from ci.yml so the coverage gate and the publish step do
+# not entangle. The report is regenerated on every push to the branches below.
+on:
+  push:
+    branches: [chore/tests, master]
+
+# Least privilege for the Pages deployment via the job's OIDC token.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deployments; do not cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules (qrcodegen/littlefs) are needed for the coverage build.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # gcc/make are preinstalled; lcov (and valgrind) are not.
+      - run: sudo apt-get update && sudo apt-get install -y valgrind lcov
+      # Run harnesses + (re)generate test/coverage/html/ via the test Makefile.
+      - run: make -C test coverage
+      # Enable Pages via the job token (no admin CLI scope needed).
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: test/coverage/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

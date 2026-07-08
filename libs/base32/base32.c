@@ -3,8 +3,8 @@
 static const char B32_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 void base32_encode(const uint8_t *in, size_t in_len, char *out) {
-    int    buffer    = 0;
-    int    bits_left = 0;
+    uint32_t buffer    = 0;
+    int      bits_left = 0;
     size_t out_len   = 0;
 
     for (size_t i = 0; i < in_len; i++) {
