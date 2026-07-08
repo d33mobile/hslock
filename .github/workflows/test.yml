@@ -1,11 +1,11 @@
 name: test
 
-# Standalone host-test workflow. Independent of the format/lint tooling: it
-# drives the test Makefile directly (make -C test ...) rather than the format
-# PR's ci wrapper script, so this suite shares no files with the format PR.
+# Standalone host-test workflow. Routes through the ./ci entrypoint
+# (./ci --check=test --action=check) so the test suite runs the same way
+# locally (git hook / CI) as every other check.
 on:
   push:
-    branches: [chore/tests, master]
+    branches: [chore/tests, chore/ci-integration, master]
   pull_request:
 
 jobs:
@@ -19,7 +19,5 @@ jobs:
       # gcc/make are preinstalled; valgrind + lcov are not.
       - run: sudo apt-get update && sudo apt-get install -y valgrind lcov
       # Hard gate: ASan+UBSan, then Valgrind. Coverage is report-only but must
-      # still build/run cleanly. Each step must exit 0 or the job fails.
-      - run: make -C test asan
-      - run: make -C test valgrind
-      - run: make -C test coverage
+      # still build/run cleanly. Dispatched via ./ci so the gate matches local.
+      - run: ./ci --check=test --action=check
