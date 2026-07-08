@@ -1,0 +1,23 @@
+name: test
+
+# Standalone host-test workflow. Routes through the ./ci entrypoint
+# (./ci --check=test --action=check) so the test suite runs the same way
+# locally (git hook / CI) as every other check.
+on:
+  push:
+    branches: [chore/tests, chore/ci-integration, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules (qrcodegen/littlefs) are needed for the coverage build.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # gcc/make are preinstalled; valgrind + lcov are not.
+      - run: sudo apt-get update && sudo apt-get install -y valgrind lcov
+      # Hard gate: ASan+UBSan, then Valgrind. Coverage is report-only but must
+      # still build/run cleanly. Dispatched via ./ci so the gate matches local.
+      - run: ./ci --check=test --action=check
