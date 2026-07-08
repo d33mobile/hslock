@@ -13,3 +13,15 @@ jobs:
       # preinstalled on GitHub-hosted ubuntu runners.
       - run: pipx install clang-format==19.1.7
       - run: ./ci --action=check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules (qrcodegen/littlefs) are needed for the coverage build.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # gcc/make are preinstalled; valgrind + lcov are not.
+      - run: sudo apt-get update && sudo apt-get install -y valgrind lcov
+      # Hard gate: ASan+UBSan + Valgrind. Coverage is report-only.
+      - run: ./ci --check=test --action=check

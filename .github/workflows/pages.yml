@@ -5,7 +5,7 @@ name: pages
 # not entangle. The report is regenerated on every push to the branches below.
 on:
   push:
-    branches: [chore/tests, master]
+    branches: [chore/ci-integration, master]
 
 # Least privilege for the Pages deployment via the job's OIDC token.
 permissions:
@@ -28,8 +28,8 @@ jobs:
           submodules: recursive
       # gcc/make are preinstalled; lcov (and valgrind) are not.
       - run: sudo apt-get update && sudo apt-get install -y valgrind lcov
-      # Run harnesses + (re)generate test/coverage/html/ via the test Makefile.
-      - run: make -C test coverage
+      # Default action=fix: run harnesses + (re)generate test/coverage/html/.
+      - run: ./ci --check=test
       # Enable Pages via the job token (no admin CLI scope needed).
       - uses: actions/configure-pages@v5
         with:

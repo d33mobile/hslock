@@ -21,5 +21,12 @@ case $check.$action in
               shells | xargs -r shellcheck ;;              # no autofix; reports only
   lint.check) srcs   | xargs -r clang-format --dry-run --Werror
               shells | xargs -r shellcheck ;;
+  # Host tests. The hard gate is ASan+UBSan + Valgrind (correctness); coverage
+  # is report-only (whole-codebase denominator keeps line% intentionally low),
+  # so it never fails CI.
+  test.check) make -C test asan
+              make -C test valgrind
+              make -C test coverage ;;
+  test.fix)   make -C test coverage ;;                     # run + (re)gen report
   *) echo "unknown --check=$check --action=$action" >&2; exit 2 ;;
 esac
