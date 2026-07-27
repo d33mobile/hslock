@@ -110,7 +110,7 @@ LCOV_IGNORE    := --ignore-errors unused,empty,mismatch,inconsistent,source,gcov
 GENHTML_IGNORE := --ignore-errors unused,empty,mismatch,inconsistent,source,negative
 LCOV           := lcov $(LCOV_RC) $(LCOV_IGNORE)
 
-.PHONY: all asan valgrind coverage fuzz fuzz-run fuzz-backup-run fuzz-totp-run fuzz-storage-run fuzz-ntp-run fuzz-cov gen-backup-seeds clean check-submodules
+.PHONY: all asan valgrind coverage fuzz fuzz-smoke fuzz-run fuzz-backup-run fuzz-totp-run fuzz-storage-run fuzz-ntp-run fuzz-cov gen-backup-seeds clean check-submodules
 
 all: asan
 
@@ -352,6 +352,32 @@ fuzz-ntp-run: $(FUZZ_NTP_BIN)
 	@echo "== fuzzing ntp_recv_cb for $(FUZZ_TIME)s =="
 	$(FUZZ_NTP_BIN) -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
 	    $(FUZZ_NTP_CORPUS)
+
+# --- fuzz-smoke: build every fuzzer + replay its committed corpus (CI gate) --
+# Deterministic, time-bounded-free regression gate. Builds all five libFuzzer
+# harnesses (clang + libFuzzer + ASan + UBSan, -fno-sanitize-recover=all) and
+# replays each one's committed seed corpus in libFuzzer's individual-input mode:
+# passing the corpus files as POSITIONAL arguments runs each seed exactly once
+# and then exits (no time-based mutation), so the run is fully deterministic.
+# A sanitizer finding on any seed (e.g. the backup `nonbool_flags` regression
+# seed tripping UBSan on a non-bool bool load) makes that binary exit non-zero
+# and fails the target. The reboot seed's watchdog_reboot() longjmp is caught
+# inside the harness, so replay always terminates cleanly. This is the target
+# CI runs to keep the fuzzers building and the committed regression seeds
+# re-exercised under the sanitizers.
+fuzz-smoke: fuzz
+	@echo "== fuzz-smoke: replaying committed corpora under ASan+UBSan =="
+	@echo "-- fuzz_console over $(FUZZ_CORPUS) --"
+	$(FUZZ_BIN) $(FUZZ_CORPUS)/*
+	@echo "-- fuzz_backup over $(FUZZ_BACKUP_CORPUS) --"
+	$(FUZZ_BACKUP_BIN) $(FUZZ_BACKUP_CORPUS)/*
+	@echo "-- fuzz_totp over $(FUZZ_TOTP_CORPUS) --"
+	$(FUZZ_TOTP_BIN) $(FUZZ_TOTP_CORPUS)/*
+	@echo "-- fuzz_storage over $(FUZZ_STORAGE_CORPUS) --"
+	$(FUZZ_STORAGE_BIN) $(FUZZ_STORAGE_CORPUS)/*
+	@echo "-- fuzz_ntp over $(FUZZ_NTP_CORPUS) --"
+	$(FUZZ_NTP_BIN) $(FUZZ_NTP_CORPUS)/*
+	@echo "== fuzz-smoke OK: all committed seeds replayed clean =="
 
 # --- Curated backup_import() seed generator ---------------------------------
 # Regenerates the committed fuzz_backup_corpus/ blobs: one per backup_import

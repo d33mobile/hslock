@@ -1,0 +1,29 @@
+name: fuzz
+
+# Fuzzer regression gate. Kept separate from the gcc-based `test` workflow
+# because libFuzzer + ASan + UBSan require clang (with the sanitizer/fuzzer
+# runtime), whereas the asan/valgrind/coverage gates are gcc. This job builds
+# ALL five libFuzzer harnesses and replays their committed seed corpora
+# (including regression seeds such as fuzz_backup_corpus/nonbool_flags) once
+# each under ASan+UBSan, so a build break or a reintroduced bug fails CI.
+on:
+  push:
+    branches: [ci/fuzz-smoke, master]
+  pull_request:
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules (qrcodegen/littlefs) are linked into every fuzzer.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # clang-19 + its sanitizer/fuzzer runtime (libclang-rt-19-dev provides
+      # libclang_rt.fuzzer/asan/ubsan). libmbedtls-dev supplies the real
+      # <mbedtls/md.h> + -lmbedcrypto the console/totp harnesses link.
+      - run: sudo apt-get update && sudo apt-get install -y clang-19 libclang-rt-19-dev libmbedtls-dev
+      # Build all fuzzers + replay the committed corpora. Deterministic
+      # (positional-file mode, no time-based mutation); exits non-zero on any
+      # sanitizer finding.
+      - run: make -C test fuzz-smoke FUZZ_CC=clang-19
