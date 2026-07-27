@@ -1,0 +1,4 @@
+login 0 0
+add-key 5 x
+export-keys
+import-keys AAAAAA

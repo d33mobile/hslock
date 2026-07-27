@@ -1,0 +1,9 @@
+login 0 0
+get-key 200
+get-key-secret 200
+rename-key 200 name
+enable-key 200
+disable-key 200
+set-key-admin 200
+unset-key-admin 200
+delete-key 200

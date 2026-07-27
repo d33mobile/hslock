@@ -1,0 +1,10 @@
+login 0 0
+get-key 300
+get-key-secret 300
+add-key 300 x
+rename-key 300 x
+enable-key 300
+disable-key 300
+delete-key 300
+set-key-admin 300
+unset-key-admin 300

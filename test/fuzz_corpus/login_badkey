@@ -1,0 +1,12 @@
+login 0 0
+add-key 5 adm
+set-key-admin 5
+add-key 1 dis
+set-key-admin 1
+disable-key 1
+add-key 2 usr
+set-wifi s p
+logout
+login 9 111111
+login 2 111111
+login 1 111111

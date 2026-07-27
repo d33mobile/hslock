@@ -1,0 +1,6 @@
+login 0 0
+add-key 7 k
+set-key-admin 7
+set-wifi myssid mypass
+logout
+login 7 000001

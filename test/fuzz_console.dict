@@ -1,0 +1,54 @@
+# libFuzzer dictionary for the hslock serial console fuzzer.
+#
+# Random bytes cannot synthesise the parser's keywords, so mutation stalls at
+# "unknown command". These tokens are every command name from the COMMANDS[]
+# table in serial/commands.c, common argument shapes, and the backup blob
+# magic/prefix, so libFuzzer can splice real commands together and reach the
+# admin-gated handlers, the TOTP path and backup_import.
+
+# --- command names (serial/commands.c COMMANDS[]) ---
+"help"
+"?"
+"status"
+"test"
+"login"
+"logout"
+"reboot"
+"get-time"
+"sync-ntp"
+"set-wifi"
+"list-keys"
+"get-key"
+"get-key-secret"
+"add-key"
+"rename-key"
+"enable-key"
+"disable-key"
+"delete-key"
+"set-key-admin"
+"unset-key-admin"
+"export-keys"
+"import-keys"
+
+# --- common argument shapes ---
+"login 0 0\x0a"
+"add-key 1 x\x0a"
+"set-wifi s p\x0a"
+" 0 "
+" 1 "
+" 255 "
+" 256 "
+"123456"
+
+# --- key-command arg shapes: error branches (id-out-of-range, nonexistent id,
+#     over-length name) so mutation can splice them onto any key handler ---
+" 300 "
+" 200 "
+"add-key 300 x\x0a"
+"delete-key 200\x0a"
+" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+
+# --- backup blob magic / base64 prefix (storage/backup.h BACKUP_MAGIC) ---
+"HSLL"
+"SFNMTA"
+"--- BEGIN HSLOCK BACKUP ---"

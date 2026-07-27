@@ -1,0 +1,4 @@
+login 0 0
+sync-ntp
+get-time
+status

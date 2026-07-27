@@ -1,0 +1,8 @@
+login 0 0
+add-key 30 gate
+set-key-admin 30
+disable-key 30
+add-key 31 door
+get-key 30
+get-key 31
+list-keys

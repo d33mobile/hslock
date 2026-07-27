@@ -1,0 +1,10 @@
+login 0 0
+add-key 10 door
+enable-key 10
+add-key 10 dup
+set-key-admin 10
+set-key-admin 10
+unset-key-admin 10
+unset-key-admin 10
+disable-key 10
+disable-key 10

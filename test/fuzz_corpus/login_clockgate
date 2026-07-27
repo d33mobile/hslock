@@ -1,0 +1,4 @@
+login 0 0
+set-wifi s p
+logout
+login 0 0

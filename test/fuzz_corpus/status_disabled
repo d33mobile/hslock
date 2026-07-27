@@ -1,0 +1,5 @@
+login 0 0
+add-key 1 x
+add-key 2 y
+disable-key 2
+status

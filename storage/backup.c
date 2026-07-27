@@ -36,9 +36,15 @@ static backup_key_t to_backup_key(const key_record_t *k) {
 
 static key_record_t to_key_record(const backup_key_t *b) {
     key_record_t k;
-    k.id                = b->id;
-    k.is_enabled        = b->is_enabled;
-    k.is_admin          = b->is_admin;
+    k.id = b->id;
+    // The backup blob is untrusted input: its is_enabled/is_admin bytes may hold
+    // any value, so read them as raw bytes and canonicalise. Loading a `bool`
+    // whose object representation is not 0/1 is undefined behaviour.
+    uint8_t enabled_raw, admin_raw;
+    memcpy(&enabled_raw, &b->is_enabled, sizeof(enabled_raw));
+    memcpy(&admin_raw, &b->is_admin, sizeof(admin_raw));
+    k.is_enabled        = (enabled_raw != 0);
+    k.is_admin          = (admin_raw != 0);
     k.created_at        = b->created_at;
     k.is_checksum_valid = true;
     memcpy(k.name, b->name, sizeof(k.name));

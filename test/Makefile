@@ -110,7 +110,7 @@ LCOV_IGNORE    := --ignore-errors unused,empty,mismatch,inconsistent,source,gcov
 GENHTML_IGNORE := --ignore-errors unused,empty,mismatch,inconsistent,source,negative
 LCOV           := lcov $(LCOV_RC) $(LCOV_IGNORE)
 
-.PHONY: all asan valgrind coverage clean check-submodules
+.PHONY: all asan valgrind coverage fuzz fuzz-smoke fuzz-run fuzz-backup-run fuzz-totp-run fuzz-storage-run fuzz-ntp-run fuzz-cov gen-backup-seeds clean check-submodules
 
 all: asan
 
@@ -229,6 +229,242 @@ coverage: check-submodules | $(COV_DIR)/obj
 	@echo "== coverage summary =="
 	$(LCOV) --summary $(COV_DIR)/coverage.info
 	@echo "== coverage OK: report at $(COV_DIR)/html/index.html =="
+
+# --- libFuzzer console harness ----------------------------------------------
+# End-to-end fuzzing of the serial-console command interface: fuzz bytes flow
+# through the REAL console_task() char accumulator -> process_line() tokeniser
+# -> commands_dispatch() -> real cmd_* handlers -> storage.c/backup.c on a
+# genuine littlefs backed by a RAM-mapped XIP window. Only hardware/network
+# leaves are stubbed. See test/fuzz_console.c for the driver.
+#
+# libFuzzer + ASan + UBSan REQUIRE clang (with the sanitizer/fuzzer runtime),
+# so this target is kept separate from the gcc-based asan/valgrind/coverage
+# gates and never runs as part of `all`. Override the compiler with
+# `make -C test fuzz FUZZ_CC=clang-19` if plain `clang` is unavailable.
+FUZZ_CC        ?= clang
+FUZZ_BIN       := $(BUILD)/fuzz_console
+FUZZ_TIME      ?= 60
+FUZZ_CORPUS    := fuzz_corpus
+FUZZ_DICT      := fuzz_console.dict
+FUZZ_FLAGS     := -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
+                  -fno-sanitize-recover=all
+FUZZ_INCLUDES  := -I$(ROOT) -I$(ROOT)/hardware -I$(ROOT)/network -I$(ROOT)/serial \
+                  -I$(ROOT)/storage -I$(SHARED) -I$(BASE32) -I$(BASE64) \
+                  -I$(QRCODEGEN) -I$(ROOT)/libs/littlefs -idirafter stub
+FUZZ_SRCS      := fuzz_console.c \
+                  $(ROOT)/serial/console.c $(ROOT)/serial/commands.c \
+                  $(ROOT)/serial/commands_system.c $(ROOT)/serial/commands_keys.c \
+                  $(ROOT)/serial/commands_network.c $(ROOT)/serial/commands_backup.c \
+                  $(ROOT)/storage/storage.c $(ROOT)/storage/backup.c \
+                  $(SHARED)/totp.c $(SHARED)/random.c \
+                  $(BASE32)/base32.c $(BASE64)/base64.c $(QRCODEGEN)/qrcodegen.c \
+                  $(ROOT)/libs/littlefs/lfs.c $(ROOT)/libs/littlefs/lfs_util.c
+FUZZ_DEFS      := -DLFS_NO_MALLOC -DLFS_NO_DEBUG
+FUZZ_LIBS      := -lmbedcrypto
+
+# Direct backup_import() deserialiser harness: fuzz bytes go straight into the
+# untrusted-blob parser on a fresh RAM-backed littlefs, bypassing console +
+# login + admin + base64. See test/fuzz_backup.c. Only storage.c/backup.c and
+# the real littlefs are linked (no console/totp/qr surface).
+FUZZ_BACKUP_BIN    := $(BUILD)/fuzz_backup
+FUZZ_BACKUP_CORPUS := fuzz_backup_corpus
+FUZZ_BACKUP_SRCS   := fuzz_backup.c \
+                      $(ROOT)/storage/storage.c $(ROOT)/storage/backup.c \
+                      $(ROOT)/libs/littlefs/lfs.c $(ROOT)/libs/littlefs/lfs_util.c
+
+# Direct totp_verify() harness: fuzz bytes are interpreted as a (time, secret)
+# pair and totp.c is driven directly, so the ACCEPT branch of totp_verify (a
+# valid in-window code -> return true) runs every replay — unreachable via the
+# console fuzzer, whose RNG-generated secret makes a random code never match.
+# Built against the REAL mbedtls (system libmbedcrypto), like the asan_totp
+# harness; -idirafter stub keeps the <mbedtls/md.h> system header winning.
+FUZZ_TOTP_BIN      := $(BUILD)/fuzz_totp
+FUZZ_TOTP_CORPUS   := fuzz_totp_corpus
+FUZZ_TOTP_SRCS     := fuzz_totp.c $(SHARED)/totp.c
+FUZZ_TOTP_INCLUDES := -I$(ROOT) -I$(ROOT)/hardware -I$(SHARED) -idirafter stub
+FUZZ_TOTP_LIBS     := -lmbedcrypto
+
+# Direct storage.c CRUD harness: fuzz bytes vary key ids/names/wifi while a
+# fixed scripted sequence drives storage.c's public API on a fresh RAM-backed
+# littlefs. Reaches the storage branches the console/backup fuzzers structurally
+# can't: the pre-mount `!mounted` guards, the mount-succeeds-first-try +
+# dir-already-exists init paths, storage_key_list's clamp/truncation exits, and
+# storage_wifi_clear (no firmware caller). See test/fuzz_storage.c.
+FUZZ_STORAGE_BIN    := $(BUILD)/fuzz_storage
+FUZZ_STORAGE_CORPUS := fuzz_storage_corpus
+FUZZ_STORAGE_SRCS   := fuzz_storage.c \
+                       $(ROOT)/storage/storage.c \
+                       $(ROOT)/libs/littlefs/lfs.c $(ROOT)/libs/littlefs/lfs_util.c
+
+# Direct NTP response-parser harness: fuzz bytes become a 48-byte UDP datagram
+# body fed straight into ntp_recv_cb() -- the REMOTE untrusted-input surface (an
+# NTP server or on-path spoofer). ntp_recv_cb is static, so fuzz_ntp.c #includes
+# the real network/ntp.c (all lwip/pico/hardware symbols stubbed inside the
+# harness); network/ntp.c is a prerequisite, not a compiled source. See
+# test/fuzz_ntp.c.
+FUZZ_NTP_BIN    := $(BUILD)/fuzz_ntp
+FUZZ_NTP_CORPUS := fuzz_ntp_corpus
+FUZZ_NTP_SRCS   := fuzz_ntp.c
+
+# Build all fuzzers.
+fuzz: check-submodules $(FUZZ_BIN) $(FUZZ_BACKUP_BIN) $(FUZZ_TOTP_BIN) $(FUZZ_STORAGE_BIN) \
+      $(FUZZ_NTP_BIN)
+
+$(FUZZ_BIN): $(FUZZ_SRCS) | $(BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_DEFS) $(FUZZ_INCLUDES) $(FUZZ_SRCS) $(FUZZ_LIBS) -o $@
+
+$(FUZZ_BACKUP_BIN): $(FUZZ_BACKUP_SRCS) | $(BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_DEFS) $(FUZZ_INCLUDES) $(FUZZ_BACKUP_SRCS) -o $@
+
+$(FUZZ_TOTP_BIN): $(FUZZ_TOTP_SRCS) | $(BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_TOTP_INCLUDES) $(FUZZ_TOTP_SRCS) $(FUZZ_TOTP_LIBS) -o $@
+
+$(FUZZ_STORAGE_BIN): $(FUZZ_STORAGE_SRCS) | $(BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_DEFS) $(FUZZ_INCLUDES) $(FUZZ_STORAGE_SRCS) -o $@
+
+$(FUZZ_NTP_BIN): $(FUZZ_NTP_SRCS) $(ROOT)/network/ntp.c | $(BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_INCLUDES) $(FUZZ_NTP_SRCS) -o $@
+
+# Build + run short bounded campaigns from the seed corpora. The console run is
+# fed the keyword dictionary so mutation can splice real commands together.
+# Bump FUZZ_TIME for a longer soak: `make -C test fuzz-run FUZZ_TIME=600`.
+fuzz-run: $(FUZZ_BIN)
+	@echo "== fuzzing serial console for $(FUZZ_TIME)s =="
+	$(FUZZ_BIN) -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	    -dict=$(FUZZ_DICT) $(FUZZ_CORPUS)
+
+fuzz-backup-run: $(FUZZ_BACKUP_BIN)
+	@echo "== fuzzing backup_import for $(FUZZ_TIME)s =="
+	$(FUZZ_BACKUP_BIN) -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	    $(FUZZ_BACKUP_CORPUS)
+
+fuzz-totp-run: $(FUZZ_TOTP_BIN)
+	@echo "== fuzzing totp_verify for $(FUZZ_TIME)s =="
+	$(FUZZ_TOTP_BIN) -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	    $(FUZZ_TOTP_CORPUS)
+
+fuzz-storage-run: $(FUZZ_STORAGE_BIN)
+	@echo "== fuzzing storage CRUD for $(FUZZ_TIME)s =="
+	$(FUZZ_STORAGE_BIN) -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	    $(FUZZ_STORAGE_CORPUS)
+
+fuzz-ntp-run: $(FUZZ_NTP_BIN)
+	@echo "== fuzzing ntp_recv_cb for $(FUZZ_TIME)s =="
+	$(FUZZ_NTP_BIN) -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	    $(FUZZ_NTP_CORPUS)
+
+# --- fuzz-smoke: build every fuzzer + replay its committed corpus (CI gate) --
+# Deterministic, time-bounded-free regression gate. Builds all five libFuzzer
+# harnesses (clang + libFuzzer + ASan + UBSan, -fno-sanitize-recover=all) and
+# replays each one's committed seed corpus in libFuzzer's individual-input mode:
+# passing the corpus files as POSITIONAL arguments runs each seed exactly once
+# and then exits (no time-based mutation), so the run is fully deterministic.
+# A sanitizer finding on any seed (e.g. the backup `nonbool_flags` regression
+# seed tripping UBSan on a non-bool bool load) makes that binary exit non-zero
+# and fails the target. The reboot seed's watchdog_reboot() longjmp is caught
+# inside the harness, so replay always terminates cleanly. This is the target
+# CI runs to keep the fuzzers building and the committed regression seeds
+# re-exercised under the sanitizers.
+fuzz-smoke: fuzz
+	@echo "== fuzz-smoke: replaying committed corpora under ASan+UBSan =="
+	@echo "-- fuzz_console over $(FUZZ_CORPUS) --"
+	$(FUZZ_BIN) $(FUZZ_CORPUS)/*
+	@echo "-- fuzz_backup over $(FUZZ_BACKUP_CORPUS) --"
+	$(FUZZ_BACKUP_BIN) $(FUZZ_BACKUP_CORPUS)/*
+	@echo "-- fuzz_totp over $(FUZZ_TOTP_CORPUS) --"
+	$(FUZZ_TOTP_BIN) $(FUZZ_TOTP_CORPUS)/*
+	@echo "-- fuzz_storage over $(FUZZ_STORAGE_CORPUS) --"
+	$(FUZZ_STORAGE_BIN) $(FUZZ_STORAGE_CORPUS)/*
+	@echo "-- fuzz_ntp over $(FUZZ_NTP_CORPUS) --"
+	$(FUZZ_NTP_BIN) $(FUZZ_NTP_CORPUS)/*
+	@echo "== fuzz-smoke OK: all committed seeds replayed clean =="
+
+# --- Curated backup_import() seed generator ---------------------------------
+# Regenerates the committed fuzz_backup_corpus/ blobs: one per backup_import
+# validation/write branch, with the VALID cases carrying a real CRC computed by
+# the firmware's own lfs_crc (linked from libs/littlefs/lfs_util.c). Run after
+# changing the wire format or the curated set. See test/gen_backup_seeds.c.
+GEN_BACKUP_BIN  := $(BUILD)/gen_backup_seeds
+GEN_BACKUP_SRCS := gen_backup_seeds.c $(ROOT)/libs/littlefs/lfs_util.c
+
+$(GEN_BACKUP_BIN): $(GEN_BACKUP_SRCS) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) -g -O1 $(WHOLE_DEFS) $(INCLUDES) $(GEN_BACKUP_SRCS) -o $@
+
+gen-backup-seeds: $(GEN_BACKUP_BIN)
+	@echo "== regenerating curated backup_import seed corpus =="
+	$(GEN_BACKUP_BIN) $(FUZZ_BACKUP_CORPUS)
+
+# --- Fuzzer coverage of the parse/logic surface ----------------------------
+# REPEATABLE measurement of how much of the fuzzable surface the committed
+# corpora exercise. Each fuzzer's sources are rebuilt with gcc --coverage and
+# -DFUZZ_REPLAY (no libFuzzer runtime) and linked with the plain replay main
+# (fuzz_replay.c), producing cov_console / cov_backup. Each replays its corpus
+# once per file, then lcov captures + merges both runs and restricts the report
+# to the nine surface files. cov_console and cov_backup share storage.c/backup.c
+# sources; because their .gcno/.gcda are prefixed with the output basename they
+# do not collide, and capturing the whole obj dir merges the two runs' hits per
+# source file (the union coverage we want). Output: a per-file + per-function
+# summary to stdout and to $(FUZZ_COV_OUT) (gitignored under coverage/).
+FUZZ_COV_OBJ := $(COV_DIR)/fuzzobj
+FUZZ_COV_OUT := $(COV_DIR)/fuzz-surface.txt
+
+# The fuzzable parse/logic surface (HW-I/O wrappers are out of scope).
+SURFACE_SRCS := serial/commands.c serial/commands_system.c serial/commands_keys.c \
+                serial/commands_network.c serial/commands_backup.c serial/console.c \
+                storage/storage.c storage/backup.c shared/totp.c network/ntp.c
+SURFACE_ABS  := $(addprefix $(REPO_ROOT)/,$(SURFACE_SRCS))
+
+# Same lcov config as `coverage`, plus function coverage so the per-function
+# summary and the uncovered-function list are populated.
+FCOV_LCOV := lcov $(LCOV_RC) --rc function_coverage=1 $(LCOV_IGNORE)
+
+fuzz-cov: check-submodules | $(FUZZ_COV_OBJ)
+	@echo "== fuzz-cov: building replay binaries (gcc --coverage) =="
+	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(FUZZ_DEFS) -DFUZZ_REPLAY $(FUZZ_INCLUDES) \
+	    $(FUZZ_SRCS) fuzz_replay.c $(FUZZ_LIBS) -o $(FUZZ_COV_OBJ)/cov_console
+	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(FUZZ_DEFS) -DFUZZ_REPLAY $(FUZZ_INCLUDES) \
+	    $(FUZZ_BACKUP_SRCS) fuzz_replay.c -o $(FUZZ_COV_OBJ)/cov_backup
+	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) -DFUZZ_REPLAY $(FUZZ_TOTP_INCLUDES) \
+	    $(FUZZ_TOTP_SRCS) fuzz_replay.c $(FUZZ_TOTP_LIBS) -o $(FUZZ_COV_OBJ)/cov_totp
+	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(FUZZ_DEFS) -DFUZZ_REPLAY $(FUZZ_INCLUDES) \
+	    $(FUZZ_STORAGE_SRCS) fuzz_replay.c -o $(FUZZ_COV_OBJ)/cov_storage
+	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) -DFUZZ_REPLAY $(FUZZ_INCLUDES) \
+	    $(FUZZ_NTP_SRCS) fuzz_replay.c -o $(FUZZ_COV_OBJ)/cov_ntp
+	@echo "== fuzz-cov: replaying corpora =="
+	$(FUZZ_COV_OBJ)/cov_console $(FUZZ_CORPUS)
+	$(FUZZ_COV_OBJ)/cov_backup $(FUZZ_BACKUP_CORPUS)
+	$(FUZZ_COV_OBJ)/cov_totp $(FUZZ_TOTP_CORPUS)
+	$(FUZZ_COV_OBJ)/cov_storage $(FUZZ_STORAGE_CORPUS)
+	$(FUZZ_COV_OBJ)/cov_ntp $(FUZZ_NTP_CORPUS)
+	@echo "== fuzz-cov: capturing + merging coverage =="
+	$(FCOV_LCOV) --capture --initial --directory $(FUZZ_COV_OBJ) \
+	    --output-file $(COV_DIR)/fuzz-base.info
+	$(FCOV_LCOV) --capture --directory $(FUZZ_COV_OBJ) \
+	    --output-file $(COV_DIR)/fuzz-run.info
+	$(FCOV_LCOV) --add-tracefile $(COV_DIR)/fuzz-base.info \
+	    --add-tracefile $(COV_DIR)/fuzz-run.info \
+	    --output-file $(COV_DIR)/fuzz-merged.info
+	@echo "== fuzz-cov: extracting the surface files =="
+	$(FCOV_LCOV) --extract $(COV_DIR)/fuzz-merged.info $(SURFACE_ABS) \
+	    --output-file $(COV_DIR)/fuzz-surface.info
+	@echo "== fuzz-cov: surface summary (also written to $(FUZZ_COV_OUT)) =="
+	@{ \
+	  echo "hslock fuzzer coverage of the parse/logic surface"; \
+	  echo "corpora: $(FUZZ_CORPUS) (console) + $(FUZZ_BACKUP_CORPUS) (backup)"; \
+	  echo; \
+	  $(FCOV_LCOV) --list $(COV_DIR)/fuzz-surface.info; \
+	  echo; \
+	  echo "Uncovered functions across the surface:"; \
+	  awk -F'[:,]' '\
+	    /^SF:/   { sf=$$2; sub(/.*\/(serial|storage|shared|network)\//,"",sf) } \
+	    /^FNA:/  { if ($$3==0) print "  " sf "  " $$4 } \
+	    /^FNDA:/ { if ($$2==0) print "  " sf "  " $$3 }' \
+	    $(COV_DIR)/fuzz-surface.info | sort || true; \
+	} | tee $(FUZZ_COV_OUT)
+	@echo "== fuzz-cov OK: $(FUZZ_COV_OUT) =="
+
+$(FUZZ_COV_OBJ):
+	mkdir -p $(FUZZ_COV_OBJ)
 
 $(BUILD):
 	mkdir -p $(BUILD)

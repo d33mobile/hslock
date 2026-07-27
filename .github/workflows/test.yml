@@ -5,7 +5,7 @@ name: test
 # PR's ci wrapper script, so this suite shares no files with the format PR.
 on:
   push:
-    branches: [chore/host-tests-suite, chore/whole-coverage, master]
+    branches: [chore/fuzz-console, master]
   pull_request:
 
 jobs:
@@ -18,9 +18,14 @@ jobs:
           submodules: recursive
       # gcc/make are preinstalled; valgrind + lcov are not. libmbedtls-dev
       # provides the real <mbedtls/md.h> + -lmbedcrypto the TOTP harness links.
-      - run: sudo apt-get update && sudo apt-get install -y valgrind lcov libmbedtls-dev
+      # clang-19 + libclang-rt-19-dev provide libFuzzer + the ASan/UBSan runtime
+      # for the fuzz-smoke gate.
+      - run: sudo apt-get update && sudo apt-get install -y valgrind lcov libmbedtls-dev clang-19 libclang-rt-19-dev
       # Hard gate: ASan+UBSan, then Valgrind. Coverage is report-only but must
       # still build/run cleanly. Each step must exit 0 or the job fails.
       - run: make -C test asan
       - run: make -C test valgrind
       - run: make -C test coverage
+      # Build the libFuzzer harnesses and replay every committed corpus (incl.
+      # regression seeds) under ASan+UBSan. Deterministic, no time-based fuzzing.
+      - run: make -C test fuzz-smoke FUZZ_CC=clang-19

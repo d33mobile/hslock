@@ -1,0 +1,9 @@
+login 0 0
+add-key 3 door
+rename-key 3 gate
+disable-key 3
+enable-key 3
+set-key-admin 3
+unset-key-admin 3
+get-key-secret 3
+delete-key 3
