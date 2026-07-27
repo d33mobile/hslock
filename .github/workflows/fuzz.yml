@@ -8,7 +8,7 @@ name: fuzz
 # each under ASan+UBSan, so a build break or a reintroduced bug fails CI.
 on:
   push:
-    branches: [ci/fuzz-smoke, master]
+    branches: [chore/fuzz-console, master]
   pull_request:
 
 jobs:
