@@ -8,15 +8,55 @@
 #include <stdio.h>
 #include <string.h>
 
-void cmd_export_keys(int argc, char **argv) {
+#define BACKUP_PASSPHRASE_MAX 64
+
+// ---------------------------------------------------------------------------
+// Read one line from the console into buf (NUL-terminated, CR/LF stripped).
+// Returns the length, or -1 on timeout with nothing entered.
+// ---------------------------------------------------------------------------
+
+static int read_line(char *buf, size_t cap, uint32_t timeout_ms) {
+    size_t          len      = 0;
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    while (!time_reached(deadline)) {
+        int c = getchar_timeout_us(10000);
+        if (c == PICO_ERROR_TIMEOUT)
+            continue;
+        if (c == '\r')
+            continue;
+        if (c == '\n')
+            break;
+        if (len < cap - 1)
+            buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    return (len == 0 && time_reached(deadline)) ? -1 : (int)len;
+}
+
+// ---------------------------------------------------------------------------
+// Per-key admin confirmation prompt (backup_admin_confirm_fn).
+// ---------------------------------------------------------------------------
+
+static bool confirm_admin_prompt(uint16_t id, const char *name, void *ctx) {
+    (void)ctx;
+    printf("[import] key %u \"%s\" grants ADMIN. import as admin? type yes:\r\n", id, name);
+    char answer[8];
+    read_line(answer, sizeof(answer), 30000);
+    return strcmp(answer, "yes") == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Emit an encrypted backup of the current key set under `passphrase`.
+// ---------------------------------------------------------------------------
+
+static void emit_backup(const char *passphrase) {
     static uint8_t export_buf[sizeof(backup_header_t) + BACKUP_MAX_KEYS * sizeof(backup_key_t)];
     static char    b64_buf[BASE64_ENCODED_LEN(sizeof(export_buf))];
 
-    int len = backup_export(export_buf, sizeof(export_buf));
+    int len = backup_export(export_buf, sizeof(export_buf), passphrase);
     if (len < 0) {
         printf("error: export failed\r\n");
         secure_wipe(export_buf, sizeof(export_buf));
-        buzzer_play_command_ack();
         return;
     }
 
@@ -28,11 +68,31 @@ void cmd_export_keys(int argc, char **argv) {
     // The blob and its base64 encoding both carry the seeds; scrub them from BSS.
     secure_wipe(export_buf, sizeof(export_buf));
     secure_wipe(b64_buf, sizeof(b64_buf));
+}
+
+void cmd_export_keys(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    printf("enter backup passphrase (encrypts the blob):\r\n");
+    char passphrase[BACKUP_PASSPHRASE_MAX];
+    if (read_line(passphrase, sizeof(passphrase), 60000) <= 0 || passphrase[0] == '\0') {
+        printf("error: no passphrase entered\r\n");
+        secure_wipe(passphrase, sizeof(passphrase));
+        buzzer_play_command_ack();
+        return;
+    }
+
+    emit_backup(passphrase);
+    secure_wipe(passphrase, sizeof(passphrase));
 
     buzzer_play_command_ack();
 }
 
 void cmd_import_keys(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
     // M3: importing overwrites every key (delete-all then rewrite) and is as
     // destructive as format-storage, yet ran with no confirmation. Gate it
     // behind an explicit CONFIRM (admin-only command, so a literal token is
@@ -66,9 +126,19 @@ void cmd_import_keys(int argc, char **argv) {
         return;
     }
 
-    // Backup first
+    printf("enter backup passphrase (decrypts the blob):\r\n");
+    char passphrase[BACKUP_PASSPHRASE_MAX];
+    if (read_line(passphrase, sizeof(passphrase), 60000) <= 0 || passphrase[0] == '\0') {
+        printf("error: no passphrase entered\r\n");
+        secure_wipe(passphrase, sizeof(passphrase));
+        buzzer_play_command_ack();
+        return;
+    }
+
+    // Safety backup of the current key set (encrypted under the same passphrase)
+    // before anything is overwritten.
     printf("backing up current keys...\r\n");
-    cmd_export_keys(0, NULL);
+    emit_backup(passphrase);
 
     printf("paste import data, then send empty line:\r\n");
 
@@ -111,12 +181,16 @@ void cmd_import_keys(int argc, char **argv) {
 
     if (overflow) {
         printf("error: import data too large\r\n");
+        secure_wipe(passphrase, sizeof(passphrase));
+        secure_wipe(b64_buf, sizeof(b64_buf));
+        secure_wipe(line, sizeof(line));
         buzzer_play_command_ack();
         return;
     }
 
     if (b64_len == 0) {
         printf("error: no data received\r\n");
+        secure_wipe(passphrase, sizeof(passphrase));
         secure_wipe(b64_buf, sizeof(b64_buf));
         secure_wipe(line, sizeof(line));
         buzzer_play_command_ack();
@@ -130,6 +204,9 @@ void cmd_import_keys(int argc, char **argv) {
     // (defence in depth), but rejecting here gives the operator a clear error.
     if (BASE64_DECODED_LEN((size_t)b64_len) > sizeof(import_buf)) {
         printf("error: import data too large\r\n");
+        secure_wipe(passphrase, sizeof(passphrase));
+        secure_wipe(b64_buf, sizeof(b64_buf));
+        secure_wipe(line, sizeof(line));
         buzzer_play_command_ack();
         return;
     }
@@ -137,6 +214,7 @@ void cmd_import_keys(int argc, char **argv) {
     int len = base64_decode(b64_buf, (size_t)b64_len, import_buf, sizeof(import_buf));
     if (len < 0) {
         printf("error: invalid base64\r\n");
+        secure_wipe(passphrase, sizeof(passphrase));
         secure_wipe(b64_buf, sizeof(b64_buf));
         secure_wipe(line, sizeof(line));
         secure_wipe(import_buf, sizeof(import_buf));
@@ -144,18 +222,15 @@ void cmd_import_keys(int argc, char **argv) {
         return;
     }
 
-    // Export current keys as backup before overwriting
-    printf("backing up current keys...\r\n");
-    cmd_export_keys(0, NULL);
-
     printf("importing...\r\n");
-    if (backup_import(import_buf, (size_t)len)) {
+    if (backup_import(import_buf, (size_t)len, passphrase, confirm_admin_prompt, NULL)) {
         printf("import ok\r\n");
     } else {
         printf("error: import failed\r\n");
     }
 
-    // The pasted blob and its decoded form both carry seeds; scrub them.
+    // The passphrase, the pasted blob and its decoded form all carry secrets; scrub them.
+    secure_wipe(passphrase, sizeof(passphrase));
     secure_wipe(b64_buf, sizeof(b64_buf));
     secure_wipe(line, sizeof(line));
     secure_wipe(import_buf, sizeof(import_buf));

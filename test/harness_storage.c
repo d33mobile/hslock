@@ -24,12 +24,81 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
+#include <mbedtls/pkcs5.h>
+
 #include "hardware/flash.h" /* XIP_BASE, FLASH_SECTOR_SIZE */
 #include "pico/stdlib.h"    /* PICO_FLASH_SIZE_BYTES, PICO_OK */
 
 #include "backup.h"
-#include "lfs_util.h" /* lfs_crc: matches backup.c's whole-backup checksum */
+#include "lfs_util.h" /* lfs_crc: matches backup.c's ciphertext checksum hint */
 #include "storage.h"
+
+/* backup.c pulls its salt/iv from get_rand_64(); the harness supplies a
+ * deterministic definition (real hardware uses the ROSC RNG). Values need not
+ * be cryptographically strong here - only distinct enough for GCM correctness. */
+uint64_t get_rand_64(void) {
+    static uint64_t s = 0x9E3779B97F4A7C15ull;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return s;
+}
+
+/* Test passphrase used for every export/import roundtrip below. */
+static const char *const PASS = "correct horse battery staple";
+
+/* Per-key admin-confirm callbacks driving backup_import's is_admin backstop. */
+static bool confirm_yes(uint16_t id, const char *name, void *ctx) {
+    (void)id;
+    (void)name;
+    (void)ctx;
+    return true;
+}
+static bool confirm_no(uint16_t id, const char *name, void *ctx) {
+    (void)id;
+    (void)name;
+    (void)ctx;
+    return false;
+}
+
+/* Forge a VALID v2 blob (correct PBKDF2 key + GCM tag) from arbitrary record
+ * bytes - the model of a passphrase holder crafting a malicious payload. Mirrors
+ * backup_export's crypto so backup_import accepts it, letting the tests inject a
+ * chosen-secret admin record / a non-bool flag byte. Returns total blob length. */
+static int forge_blob(const char *passphrase, const backup_key_t *recs, uint32_t count,
+                      uint8_t *out) {
+    backup_header_t hdr = {0};
+    hdr.magic           = BACKUP_MAGIC;
+    hdr.version         = BACKUP_VERSION;
+    hdr.key_count       = count;
+    for (int i = 0; i < BACKUP_SALT_LEN; i++)
+        hdr.salt[i] = (uint8_t)(0xA0 + i);
+    for (int i = 0; i < BACKUP_IV_LEN; i++)
+        hdr.iv[i] = (uint8_t)(0x50 + i);
+
+    uint8_t key[BACKUP_KEY_LEN];
+    assert(mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)passphrase,
+                                         strlen(passphrase), hdr.salt, BACKUP_SALT_LEN,
+                                         BACKUP_PBKDF2_ITERS, BACKUP_KEY_LEN, key) == 0);
+
+    size_t   cipher_len = (size_t)count * sizeof(backup_key_t);
+    uint8_t *ct         = out + sizeof(backup_header_t);
+
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    assert(mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, BACKUP_KEY_LEN * 8) == 0);
+    assert(mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, cipher_len, hdr.iv, BACKUP_IV_LEN,
+                                     (const unsigned char *)&hdr, BACKUP_AAD_LEN,
+                                     (const unsigned char *)recs, ct, BACKUP_TAG_LEN,
+                                     hdr.tag) == 0);
+    mbedtls_gcm_free(&gcm);
+
+    hdr.checksum = lfs_crc(0xFFFFFFFF, ct, cipher_len);
+    memcpy(out, &hdr, sizeof(hdr));
+    return (int)(sizeof(backup_header_t) + cipher_len);
+}
 
 /* Must match storage.c's private layout constants. */
 #define STORAGE_SIZE_BYTES   (256 * 1024)
@@ -227,15 +296,37 @@ int main(void) {
     assert(storage_wifi_get(&wgot) == false); /* gone */
     assert(storage_wifi_clear() == false);    /* already gone */
 
-    /* --- backup export -> import roundtrip -------------------------------- */
-    /* Current store holds keys id=1 (updated) and id=3. */
+    /* --- H6: encrypt-then-MAC backup export -> import roundtrip ----------- */
+    /* Current store holds id=1 (non-admin) and id=3 (ADMIN). */
     static uint8_t backup[sizeof(backup_header_t) + BACKUP_MAX_KEYS * sizeof(backup_key_t)];
-    int            blen = backup_export(backup, sizeof backup);
+    int            blen = backup_export(backup, sizeof backup, PASS);
     assert(blen > 0);
     assert((size_t)blen == sizeof(backup_header_t) + 2 * sizeof(backup_key_t));
 
-    /* buffer too small -> -1 */
-    assert(backup_export(backup, sizeof(backup_header_t)) == -1);
+    /* the header is cleartext + well-formed; the payload is ciphertext, so it
+     * must NOT contain the raw seeds in the clear. */
+    {
+        const backup_header_t *h = (const backup_header_t *)backup;
+        assert(h->magic == BACKUP_MAGIC && h->version == BACKUP_VERSION && h->key_count == 2);
+        /* k3's secret starts at byte 0x40 (make_key seed); it must not appear
+         * verbatim anywhere in the ciphertext. */
+        uint8_t needle[KEY_SECRET_LEN];
+        for (int i = 0; i < KEY_SECRET_LEN; i++)
+            needle[i] = (uint8_t)(0x40 + i);
+        bool leaked = false;
+        for (size_t off = sizeof(backup_header_t); off + KEY_SECRET_LEN <= (size_t)blen; off++)
+            if (memcmp(backup + off, needle, KEY_SECRET_LEN) == 0)
+                leaked = true;
+        assert(!leaked);
+    }
+
+    /* buffer too small -> -1; missing passphrase -> -1 */
+    assert(backup_export(backup, sizeof(backup_header_t), PASS) == -1);
+    assert(backup_export(backup, sizeof backup, NULL) == -1);
+    assert(backup_export(backup, sizeof backup, "") == -1);
+    /* re-export a good blob for the tests below */
+    blen = backup_export(backup, sizeof backup, PASS);
+    assert(blen > 0);
 
     /* Snapshot expected keys, then wipe the store. */
     key_record_t expect[8];
@@ -245,8 +336,9 @@ int main(void) {
         assert(storage_key_delete(expect[i].id) == true);
     assert(storage_key_list(list, 16) == 0);
 
-    /* Import restores them. */
-    assert(backup_import(backup, (size_t)blen) == true);
+    /* Import with the right passphrase restores everything (the admin key id=3
+     * is confirmed via confirm_yes). */
+    assert(backup_import(backup, (size_t)blen, PASS, confirm_yes, NULL) == true);
     int restored_n = storage_key_list(list, 16);
     assert(restored_n == expect_n);
     for (int i = 0; i < expect_n; i++) {
@@ -255,100 +347,109 @@ int main(void) {
         assert(keys_equal(&expect[i], &r));
     }
 
-    /* --- corrupt / invalid backups all rejected --------------------------- */
-    /* too small */
-    assert(backup_import(backup, sizeof(backup_header_t) - 1) == false);
+    /* --- wrong passphrase -> rejected, store untouched -------------------- */
+    assert(backup_import(backup, (size_t)blen, "wrong passphrase", confirm_yes, NULL) == false);
+    assert(backup_import(backup, (size_t)blen, NULL, confirm_yes, NULL) == false);
+    assert(storage_key_list(list, 16) == expect_n);
 
-    /* bad magic */
+    /* --- malformed / tampered blobs all rejected before any parse --------- */
+    /* too small */
+    assert(backup_import(backup, sizeof(backup_header_t) - 1, PASS, confirm_yes, NULL) == false);
+    /* bad magic (pre-decrypt header check) */
     {
         uint8_t bad[sizeof backup];
         memcpy(bad, backup, (size_t)blen);
-        backup_header_t *h = (backup_header_t *)bad;
-        h->magic           = 0xDEADBEEFu;
-        assert(backup_import(bad, (size_t)blen) == false);
+        ((backup_header_t *)bad)->magic = 0xDEADBEEFu;
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
     }
     /* bad version */
     {
         uint8_t bad[sizeof backup];
         memcpy(bad, backup, (size_t)blen);
-        backup_header_t *h = (backup_header_t *)bad;
-        h->version         = BACKUP_VERSION + 1;
-        assert(backup_import(bad, (size_t)blen) == false);
+        ((backup_header_t *)bad)->version = BACKUP_VERSION + 1;
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
     }
     /* key_count too large */
     {
         uint8_t bad[sizeof backup];
         memcpy(bad, backup, (size_t)blen);
-        backup_header_t *h = (backup_header_t *)bad;
-        h->key_count       = KEY_MAX_COUNT + 1;
-        assert(backup_import(bad, (size_t)blen) == false);
+        ((backup_header_t *)bad)->key_count = KEY_MAX_COUNT + 1;
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
     }
     /* truncated body (header claims more keys than bytes provided) */
     {
         uint8_t bad[sizeof backup];
         memcpy(bad, backup, (size_t)blen);
-        backup_header_t *h = (backup_header_t *)bad;
-        h->key_count       = 200; /* body far shorter than 200 records */
-        assert(backup_import(bad, (size_t)blen) == false);
+        ((backup_header_t *)bad)->key_count = 200;
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
     }
-    /* checksum mismatch (flip a payload byte, keep header intact) */
+    /* GCM tag tampered (CRC still valid) -> MAC failure */
+    {
+        uint8_t bad[sizeof backup];
+        memcpy(bad, backup, (size_t)blen);
+        ((backup_header_t *)bad)->tag[0] ^= 0xFF;
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
+    }
+    /* ciphertext byte flipped -> MAC failure */
     {
         uint8_t bad[sizeof backup];
         memcpy(bad, backup, (size_t)blen);
         bad[sizeof(backup_header_t)] ^= 0xFF;
-        assert(backup_import(bad, (size_t)blen) == false);
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
+    }
+    /* AAD tampered: key_count altered within range (2 -> 1) -> MAC failure */
+    {
+        uint8_t bad[sizeof backup];
+        memcpy(bad, backup, (size_t)blen);
+        ((backup_header_t *)bad)->key_count = 1;
+        assert(backup_import(bad, (size_t)blen, PASS, confirm_yes, NULL) == false);
     }
 
     /* The store still holds the good import after all rejected attempts. */
     assert(storage_key_list(list, 16) == expect_n);
 
     /* --- M3: empty / admin-less imports rejected before wiping keys ------- */
-    /* Regression for the fail-open wipe. A key_count==0 blob (backup_checksum
-     * over zero records is 0xFFFFFFFF, so it once cleared every gate), and a
-     * well-formed checksum-valid blob carrying no enabled+admin record, both
-     * let the unconditional delete loop strand the device with no admin key
-     * (any_admin == false -> cmd_login hands out admin to any credentials).
-     * Both must now be refused BEFORE any key is touched; a blob with >= 1
-     * enabled admin still imports. */
+    /* Regression for the fail-open wipe. A key_count==0 blob (refused before
+     * any crypto), and a well-formed AUTHENTICATED blob carrying no enabled+admin
+     * record, both let the unconditional delete loop strand the device with no
+     * admin key (any_admin == false -> cmd_login hands out admin to any
+     * credentials). Both must be refused BEFORE any key is touched; a blob with
+     * >= 1 enabled admin still imports. Under H6 the payload is GCM-encrypted, so
+     * the non-empty cases are built with forge_blob (a valid PBKDF2 key + tag). */
     assert(storage_key_list(list, 16) == expect_n); /* keys 1 & 3 present */
 
-    /* (a) zero-key blob: rejected, existing keys untouched. */
+    /* (a) zero-key blob: refused before crypto, existing keys untouched. */
     {
         uint8_t         empty[sizeof(backup_header_t)];
-        backup_header_t eh = {.magic     = BACKUP_MAGIC,
-                              .version   = BACKUP_VERSION,
-                              .key_count = 0,
-                              .checksum  = 0xFFFFFFFFu}; /* lfs_crc(~0,x,0)==~0 */
+        backup_header_t eh = {0};
+        eh.magic           = BACKUP_MAGIC;
+        eh.version         = BACKUP_VERSION;
+        eh.key_count       = 0;
         memcpy(empty, &eh, sizeof eh);
-        assert(backup_import(empty, sizeof empty) == false);
+        assert(backup_import(empty, sizeof empty, PASS, confirm_yes, NULL) == false);
         assert(storage_key_list(list, 16) == expect_n);
     }
 
-    /* (b) one enabled-but-non-admin key: rejected before the delete loop. */
+    /* (b) one enabled-but-non-admin key: authenticated, yet refused before the
+     * delete loop because the payload has no enabled admin. */
     {
-        static uint8_t blob[sizeof(backup_header_t) + sizeof(backup_key_t)];
-        backup_key_t  *rec = (backup_key_t *)(blob + sizeof(backup_header_t));
-        backup_key_t   bk  = {0};
-        bk.id              = 50;
+        backup_key_t bk = {0};
+        bk.id           = 50;
         snprintf(bk.name, sizeof bk.name, "user");
         memset(bk.secret, 0x11, sizeof bk.secret);
         bk.is_enabled = true;
         bk.is_admin   = false;
         bk.created_at = 1700009000u;
-        memcpy(rec, &bk, sizeof bk);
-        backup_header_t bh = {.magic     = BACKUP_MAGIC,
-                              .version   = BACKUP_VERSION,
-                              .key_count = 1,
-                              .checksum  = lfs_crc(0xFFFFFFFF, rec, sizeof(backup_key_t))};
-        memcpy(blob, &bh, sizeof bh);
-        assert(backup_import(blob, sizeof blob) == false);
+
+        static uint8_t blob[sizeof(backup_header_t) + sizeof(backup_key_t)];
+        int            n = forge_blob(PASS, &bk, 1, blob);
+        assert(backup_import(blob, (size_t)n, PASS, confirm_yes, NULL) == false);
         assert(storage_key_list(list, 16) == expect_n); /* untouched */
 
-        /* (c) same blob, now enabled + admin -> import succeeds, replaces store. */
-        rec->is_admin = true;
-        bh.checksum   = lfs_crc(0xFFFFFFFF, rec, sizeof(backup_key_t));
-        memcpy(blob, &bh, sizeof bh);
-        assert(backup_import(blob, sizeof blob) == true);
+        /* (c) same record, now enabled + admin -> import succeeds, replaces store. */
+        bk.is_admin = true;
+        n           = forge_blob(PASS, &bk, 1, blob);
+        assert(backup_import(blob, (size_t)n, PASS, confirm_yes, NULL) == true);
         assert(storage_key_list(list, 16) == 1);
         key_record_t g;
         assert(storage_key_get(50, &g) == true);
@@ -357,27 +458,66 @@ int main(void) {
     }
     assert(storage_key_list(list, 16) == 0); /* store empty for the UBSan block */
 
-    /* --- UBSan regression: non-bool flag byte in an otherwise-valid blob --- */
-    /* to_key_record() must not load is_enabled/is_admin straight into a `bool`:
-     * a crafted import blob can carry any byte there, and loading a bool whose
-     * object representation is not 0/1 is undefined behaviour (caught by
-     * -fsanitize=undefined). Build a valid 1-key blob, poke a non-bool flag
-     * byte, refresh the header CRC so the blob still validates, and import it.
-     * The import must succeed and the flag must read back canonicalised. */
+    /* --- an exported empty store is itself a zero-key blob whose import is
+     * refused by M3 (not a silent wipe of the target device). H6 pre-dated M3
+     * and expected this to roundtrip; M3 makes the empty import fail-closed. */
     {
-        key_record_t seed = make_key(9, "ub", true, false, 1234, 0x40);
-        assert(storage_key_save(&seed) == true);
+        int elen = backup_export(backup, sizeof backup, PASS);
+        assert((size_t)elen == sizeof(backup_header_t));
+        assert(backup_import(backup, (size_t)elen, PASS, confirm_yes, NULL) == false);
+        assert(storage_key_list(list, 16) == 0);
+    }
+
+    /* --- is_admin backstop: an authenticated admin record still needs per-key
+     * operator confirmation. Forge a VALID blob (correct passphrase, real GCM
+     * tag) carrying a chosen-secret admin record - the exact H6 escalation. --- */
+    {
+        backup_key_t evil = {0};
+        evil.id           = 7;
+        snprintf(evil.name, sizeof evil.name, "pwned");
+        for (int i = 0; i < KEY_SECRET_LEN; i++)
+            evil.secret[i] = (uint8_t)i;
+        evil.is_enabled = true;
+        evil.is_admin   = true;
+        evil.created_at = 42;
+
         uint8_t craft[sizeof backup];
-        int     clen = backup_export(craft, sizeof craft);
-        assert((size_t)clen == sizeof(backup_header_t) + sizeof(backup_key_t));
-        assert(storage_key_delete(9) == true);
+        int     clen = forge_blob(PASS, &evil, 1, craft);
 
-        backup_key_t *bk          = (backup_key_t *)(craft + sizeof(backup_header_t));
-        *(uint8_t *)&bk->is_admin = 67; /* non-bool byte in an otherwise-valid record */
-        backup_header_t *bh       = (backup_header_t *)craft;
-        bh->checksum              = lfs_crc(0xFFFFFFFF, bk, sizeof(backup_key_t));
+        /* denied by the operator -> rejected, store untouched */
+        assert(backup_import(craft, (size_t)clen, PASS, confirm_no, NULL) == false);
+        assert(storage_key_list(list, 16) == 0);
+        /* NULL callback denies all admin records */
+        assert(backup_import(craft, (size_t)clen, PASS, NULL, NULL) == false);
+        assert(storage_key_list(list, 16) == 0);
+        /* confirmed -> imported as admin */
+        assert(backup_import(craft, (size_t)clen, PASS, confirm_yes, NULL) == true);
+        key_record_t g;
+        assert(storage_key_get(7, &g) == true);
+        assert(g.is_admin == true);
+        assert(storage_key_delete(7) == true);
+    }
 
-        assert(backup_import(craft, (size_t)clen) == true);
+    /* --- UBSan regression: non-bool flag byte in an authenticated payload --- */
+    /* to_key_record() must not load is_enabled/is_admin straight into a `bool`:
+     * a passphrase holder can forge a validly-encrypted record with any byte in
+     * those fields, and loading a bool whose representation is not 0/1 is UB
+     * (caught by -fsanitize=undefined). Forge a valid 1-key blob with a non-bool
+     * admin byte; import (confirmed) must succeed and read back canonicalised. */
+    {
+        backup_key_t bk = {0};
+        bk.id           = 9;
+        snprintf(bk.name, sizeof bk.name, "ub");
+        for (int i = 0; i < KEY_SECRET_LEN; i++)
+            bk.secret[i] = (uint8_t)(0x40 + i);
+        *(uint8_t *)&bk.is_enabled = 1;
+        *(uint8_t *)&bk.is_admin   = 67; /* non-bool byte */
+        bk.created_at              = 1234;
+
+        uint8_t craft[sizeof backup];
+        int     clen = forge_blob(PASS, &bk, 1, craft);
+
+        assert(backup_import(craft, (size_t)clen, PASS, confirm_yes, NULL) == true);
         key_record_t g;
         assert(storage_key_get(9, &g) == true);
         assert(g.is_admin == true);   /* canonicalised: exactly 1, not 67 */

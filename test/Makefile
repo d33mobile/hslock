@@ -61,6 +61,15 @@ TOTP_LIBS     := -lmbedcrypto
 STORAGE_SRCS := harness_storage.c $(ROOT)/storage/storage.c $(ROOT)/storage/backup.c \
                 $(ROOT)/libs/littlefs/lfs.c $(ROOT)/libs/littlefs/lfs_util.c
 STORAGE_DEFS := -DLFS_NO_MALLOC -DLFS_NO_DEBUG
+# backup.c now encrypt-then-MACs the blob (AES-256-GCM + PBKDF2) via mbedtls, so
+# the storage harness links the REAL system mbedtls (libmbedtls-dev). `-idirafter
+# stub` keeps the pico/hardware/lwip shims reachable while letting the real
+# <mbedtls/gcm.h,pkcs5.h,md.h> (system dirs) win over the compile-only
+# stub/mbedtls/md.h (which lacks GCM/PKCS5 and SHA-256).
+STORAGE_INCLUDES := -I$(ROOT) -I$(ROOT)/hardware -I$(ROOT)/network -I$(ROOT)/serial \
+                    -I$(ROOT)/storage -I$(SHARED) -I$(BASE32) -I$(BASE64) \
+                    -I$(QRCODEGEN) -I$(ROOT)/libs/littlefs -idirafter stub
+STORAGE_LIBS := -lmbedcrypto
 
 # Commands harness: links serial/commands.c (the dispatcher) against SPY handler
 # stubs + a stub buzzer, all inside harness_commands.c. No real key/system/
@@ -87,6 +96,14 @@ WHOLE_SRCS := $(ROOT)/hardware/buzzer.c $(ROOT)/hardware/clock.c \
 # LittleFS build knobs, mirrored from the top-level CMakeLists so storage.c and
 # backup.c see the same lfs.h / lfs_util.h configuration the firmware does.
 WHOLE_DEFS := -DLFS_NO_MALLOC -DLFS_NO_DEBUG
+
+# Same include roots as INCLUDES but with stub as `-idirafter` so the REAL system
+# mbedtls headers win: backup.c (AES-GCM/PKCS5) and totp.c (HMAC-SHA1) are
+# compiled compile-only here and the stub/mbedtls/md.h lacks GCM/PKCS5/SHA-256.
+# Everything else (pico/hardware/lwip) has no system header, so stub still wins.
+WHOLE_INCLUDES := -I$(ROOT) -I$(ROOT)/hardware -I$(ROOT)/network -I$(ROOT)/serial \
+                  -I$(ROOT)/storage -I$(SHARED) -I$(BASE32) -I$(BASE64) \
+                  -I$(QRCODEGEN) -I$(ROOT)/libs/littlefs -idirafter stub
 
 CC       := gcc
 CSTD     := -std=c11
@@ -143,7 +160,7 @@ $(BUILD)/asan_totp: $(TOTP_SRCS) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(ASAN_FLAGS) $(TOTP_INCLUDES) $(TOTP_SRCS) $(TOTP_LIBS) -o $@
 
 $(BUILD)/asan_storage: $(STORAGE_SRCS) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(ASAN_FLAGS) $(STORAGE_DEFS) $(INCLUDES) $(STORAGE_SRCS) -o $@
+	$(CC) $(CSTD) $(WARN) $(ASAN_FLAGS) $(STORAGE_DEFS) $(STORAGE_INCLUDES) $(STORAGE_SRCS) $(STORAGE_LIBS) -o $@
 
 $(BUILD)/asan_commands: $(COMMANDS_SRCS) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(ASAN_FLAGS) $(INCLUDES) $(COMMANDS_SRCS) -o $@
@@ -169,7 +186,7 @@ $(BUILD)/vg_totp: $(TOTP_SRCS) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(VG_FLAGS) $(TOTP_INCLUDES) $(TOTP_SRCS) $(TOTP_LIBS) -o $@
 
 $(BUILD)/vg_storage: $(STORAGE_SRCS) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(VG_FLAGS) $(STORAGE_DEFS) $(INCLUDES) $(STORAGE_SRCS) -o $@
+	$(CC) $(CSTD) $(WARN) $(VG_FLAGS) $(STORAGE_DEFS) $(STORAGE_INCLUDES) $(STORAGE_SRCS) $(STORAGE_LIBS) -o $@
 
 $(BUILD)/vg_commands: $(COMMANDS_SRCS) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(VG_FLAGS) $(INCLUDES) $(COMMANDS_SRCS) -o $@
@@ -191,8 +208,8 @@ coverage: check-submodules | $(COV_DIR)/obj
 	    -o $(COV_DIR)/obj/cov_base64
 	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(TOTP_INCLUDES) $(TOTP_SRCS) $(TOTP_LIBS) \
 	    -o $(COV_DIR)/obj/cov_totp
-	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(STORAGE_DEFS) $(INCLUDES) $(STORAGE_SRCS) \
-	    -o $(COV_DIR)/obj/cov_storage
+	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(STORAGE_DEFS) $(STORAGE_INCLUDES) $(STORAGE_SRCS) \
+	    $(STORAGE_LIBS) -o $(COV_DIR)/obj/cov_storage
 	$(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(INCLUDES) $(COMMANDS_SRCS) \
 	    -o $(COV_DIR)/obj/cov_commands
 	@echo "== coverage: running instrumented harnesses =="
@@ -205,7 +222,7 @@ coverage: check-submodules | $(COV_DIR)/obj
 	@for src in $(WHOLE_SRCS); do \
 	    obj=$(COV_DIR)/obj/whole_$$(echo $$src | tr '/.' '__').o; \
 	    echo "  CC $$src"; \
-	    $(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(WHOLE_DEFS) $(INCLUDES) \
+	    $(CC) $(CSTD) $(WARN) $(COV_FLAGS) $(WHOLE_DEFS) $(WHOLE_INCLUDES) \
 	        -c $$src -o $$obj || exit 1; \
 	done
 	@echo "== coverage: capturing baseline (all .gcno at 0%) + run data =="
