@@ -4,6 +4,7 @@
 #include "lfs_util.h"
 #include "pico/rand.h"
 
+#include <mbedtls/version.h>
 #include <mbedtls/gcm.h>
 #include <mbedtls/pkcs5.h>
 #include <mbedtls/md.h>
@@ -52,9 +53,28 @@ static void fill_random(uint8_t *out, size_t n) {
 static int derive_key(const char *passphrase, const uint8_t *salt, uint8_t key[BACKUP_KEY_LEN]) {
     if (passphrase == NULL || passphrase[0] == '\0')
         return -1;
+    // PBKDF2-HMAC-SHA256. mbedtls_pkcs5_pbkdf2_hmac_ext exists only in 3.6+ (the
+    // context-based form it replaces is deprecated there); pre-3.6 (some CI hosts
+    // / pico-sdk snapshots) has only the context form. Pick per version so the
+    // build is warning-clean on both.
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03060000
     return mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)passphrase,
                                          strlen(passphrase), salt, BACKUP_SALT_LEN,
                                          BACKUP_PBKDF2_ITERS, BACKUP_KEY_LEN, key);
+#else
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md == NULL)
+        return -1;
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    int rc = mbedtls_md_setup(&ctx, md, 1 /* HMAC */);
+    if (rc == 0)
+        rc = mbedtls_pkcs5_pbkdf2_hmac(&ctx, (const unsigned char *)passphrase, strlen(passphrase),
+                                       salt, BACKUP_SALT_LEN, BACKUP_PBKDF2_ITERS, BACKUP_KEY_LEN,
+                                       key);
+    mbedtls_md_free(&ctx);
+    return rc;
+#endif
 }
 
 // ---------------------------------------------------------------------------

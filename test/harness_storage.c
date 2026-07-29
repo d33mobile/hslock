@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include <mbedtls/version.h>
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
@@ -79,9 +80,21 @@ static int forge_blob(const char *passphrase, const backup_key_t *recs, uint32_t
         hdr.iv[i] = (uint8_t)(0x50 + i);
 
     uint8_t key[BACKUP_KEY_LEN];
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03060000
     assert(mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)passphrase,
                                          strlen(passphrase), hdr.salt, BACKUP_SALT_LEN,
                                          BACKUP_PBKDF2_ITERS, BACKUP_KEY_LEN, key) == 0);
+#else
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    assert(md != NULL);
+    mbedtls_md_context_t md_ctx;
+    mbedtls_md_init(&md_ctx);
+    assert(mbedtls_md_setup(&md_ctx, md, 1 /* HMAC */) == 0);
+    assert(mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char *)passphrase, strlen(passphrase),
+                                     hdr.salt, BACKUP_SALT_LEN, BACKUP_PBKDF2_ITERS, BACKUP_KEY_LEN,
+                                     key) == 0);
+    mbedtls_md_free(&md_ctx);
+#endif
 
     size_t   cipher_len = (size_t)count * sizeof(backup_key_t);
     uint8_t *ct         = out + sizeof(backup_header_t);
